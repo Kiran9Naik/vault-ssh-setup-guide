@@ -1,0 +1,164 @@
+# Vault SSH Setup and Configuration Guide
+
+This guide provides a step-by-step procedure to install HashiCorp Vault, enable the SSH secrets engine, and configure remote SSH login using Vault-generated signed certificates. 
+---
+
+## 1. Install Vault on Linux Server
+
+```bash
+wget https://releases.hashicorp.com/vault/1.13.0/vault_1.13.0_linux_amd64.zip
+mv vault_1.13.0_linux_amd64.zip vault.zip
+unzip vault.zip
+sudo mv vault /usr/local/bin/
+sudo mkdir /etc/vault.d
+vi /etc/vault.d/vault.hcl
+```
+
+### vault.hcl configuration:
+```hcl
+storage "file" {
+  path = "/opt/vault/data"
+}
+
+listener "tcp" {
+  address = "0.0.0.0:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://0.0.0.0:8200"
+#cluster_addr = "https://127.0.0.1:8201"
+ui = true
+disable_mlock = true
+```
+
+```bash
+sudo chmod 600 /etc/vault.d/vault.hcl
+sudo nano /etc/systemd/system/vault.service
+```
+
+### vault.service file content:
+```ini
+[Unit]
+Description=HashiCorp Vault
+Documentation=https://www.vaultproject.io/docs/
+After=network.target
+
+[Service]
+User=vault
+Group=vault
+ExecStart=/usr/local/bin/vault server -config=/etc/vault.d/vault.hcl
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo useradd --system --home /etc/vault.d --shell /bin/false vault
+sudo mkdir /opt/vault
+sudo chown -R vault:vault /opt/vault /etc/vault.d
+sudo systemctl daemon-reload
+sudo systemctl enable vault
+sudo systemctl start vault
+sudo systemctl status vault
+journalctl -u vault.service
+```
+
+---
+
+## 2. Enable SSH Secrets Engine
+
+```bash
+vault secrets enable ssh
+```
+
+### Create a Role:
+```bash
+vault write ssh/roles/my-role -<<EOF
+{
+  "algorithm_signer": "rsa-sha2-256",
+  "allow_user_certificates": true,
+  "allowed_users": "*",
+  "allowed_extensions": "permit-pty,permit-port-forwarding",
+  "default_extensions": {
+    "permit-pty": ""
+  },
+  "key_type": "ca",
+  "default_user": "ubuntu",
+  "ttl": "30m0s"
+}
+EOF
+```
+
+## 3. Generate CA Key
+
+```bash
+vault write ssh/config/ca generate_signing_key=true
+```
+
+## 4. Configure SSH Daemon on Remote Machine
+
+Edit `/etc/ssh/sshd_config`:
+```ini
+TrustedUserCAKeys /etc/ssh/ca.pub
+```
+
+```bash
+vault read -field=public_key ssh/config/ca > /etc/ssh/ca.pub
+systemctl restart sshd
+```
+
+---
+
+## 5. Generate SSH Key Pair
+
+### Method 1:
+```bash
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa
+```
+
+### Method 2 (with comment):
+```bash
+ssh-keygen -t rsa -C "you@example.com"
+```
+
+---
+
+## 6. Sign the Public Key with Vault
+
+```bash
+vault write -field=signed_key ssh/sign/my-role public_key=@$HOME/.ssh/id_rsa.pub > signed-cert.pub
+```
+
+## 7. SSH into Remote Host
+
+```bash
+ssh -i signed-cert.pub -i ~/.ssh/id_rsa ubuntu@<remote-ip>
+```
+
+---
+
+## 8. Summary of SSH Configuration on Remote Host
+
+1. Add to `/etc/ssh/sshd_config`:
+```ini
+TrustedUserCAKeys /etc/ssh/ca.pub
+```
+2. Pull and write the CA public key:
+```bash
+vault read -field=public_key ssh/config/ca > /etc/ssh/ca.pub
+```
+3. Restart SSH:
+```bash
+systemctl restart sshd
+```
+
+Once this is done, users with signed certificates from Vault will be able to authenticate via SSH.
+
+---
+
+### Note:
+Ensure the Vault server is running and accessible, and the system clock is in sync on all servers to avoid certificate validation issues.
+
+
